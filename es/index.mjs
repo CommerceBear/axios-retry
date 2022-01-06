@@ -142,6 +142,46 @@ async function shouldRetry(retries, retryCondition, currentState, error) {
 }
 
 /**
+ * The context needed to retry a request.
+ * @typedef RetryContext
+ * @type {object}
+ * @property {AxiosRequestConfig} config
+ * @property {AxiosResponse | undefined} response
+ */
+/**
+ * Retries a request.
+ * @param  {Axios} axios
+ * @param  {AxiosRetryConfig} defaultOptions
+ * @param  {RetryContext} context
+ * @return {any}
+ */
+function retryWithContext(axios, defaultOptions, context) {
+  const { config } = context;
+  const { retryDelay = noDelay, shouldResetTimeout = false } = getRequestOptions(
+    config,
+    defaultOptions
+  );
+
+  const currentState = getCurrentState(config);
+  currentState.retryCount += 1;
+  const delay = retryDelay(currentState.retryCount, context);
+
+  // Axios fails merging this configuration to the default configuration because it has an issue
+  // with circular structures: https://github.com/mzabriskie/axios/issues/370
+  fixConfig(axios, config);
+
+  if (!shouldResetTimeout && config.timeout && currentState.lastRequestTime) {
+    const lastRequestDuration = Date.now() - currentState.lastRequestTime;
+    // Minimum 1ms timeout (passing 0 or less to XHR means no timeout)
+    config.timeout = Math.max(config.timeout - lastRequestDuration - delay, 1);
+  }
+
+  config.transformRequest = [(data) => data];
+
+  return new Promise((resolve) => setTimeout(() => resolve(axios(config)), delay));
+}
+
+/**
  * Adds response interceptors to an axios instance to retry requests failed due to network issues
  *
  * @example
@@ -200,44 +240,40 @@ export default function axiosRetry(axios, defaultOptions) {
     return config;
   });
 
-  axios.interceptors.response.use(null, async (error) => {
-    const { config } = error;
+  const responseInterceptor = (contextConstructor, contextResolver) => async (responseOrError) => {
+    const context = contextConstructor(responseOrError);
+    const { config } = context;
 
-    // If we have no information to retry the request
     if (!config) {
-      return Promise.reject(error);
+      return contextResolver(context);
     }
 
-    const {
-      retries = 3,
-      retryCondition = isNetworkOrIdempotentRequestError,
-      retryDelay = noDelay,
-      shouldResetTimeout = false
-    } = getRequestOptions(config, defaultOptions);
+    const { retries = 3, retryCondition = isNetworkOrIdempotentRequestError } = getRequestOptions(
+      config,
+      defaultOptions
+    );
 
     const currentState = getCurrentState(config);
 
-    if (await shouldRetry(retries, retryCondition, currentState, error)) {
-      currentState.retryCount += 1;
-      const delay = retryDelay(currentState.retryCount, error);
-
-      // Axios fails merging this configuration to the default configuration because it has an issue
-      // with circular structures: https://github.com/mzabriskie/axios/issues/370
-      fixConfig(axios, config);
-
-      if (!shouldResetTimeout && config.timeout && currentState.lastRequestTime) {
-        const lastRequestDuration = Date.now() - currentState.lastRequestTime;
-        // Minimum 1ms timeout (passing 0 or less to XHR means no timeout)
-        config.timeout = Math.max(config.timeout - lastRequestDuration - delay, 1);
-      }
-
-      config.transformRequest = [(data) => data];
-
-      return new Promise((resolve) => setTimeout(() => resolve(axios(config)), delay));
+    if (await shouldRetry(retries, retryCondition, currentState, context)) {
+      return retryWithContext(axios, defaultOptions, context);
     }
 
-    return Promise.reject(error);
-  });
+    return contextResolver(context);
+  };
+
+  axios.interceptors.response.use(
+    // Intercept successful responses.
+    responseInterceptor(
+      (response = {}) => ({ config: response.config, response }),
+      (context) => Promise.resolve(context.response)
+    ),
+    // Intercept failed responses.
+    responseInterceptor(
+      (error) => error,
+      (context) => Promise.reject(context)
+    )
+  );
 }
 
 // Compatibility with CommonJS

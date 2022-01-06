@@ -52,6 +52,25 @@ describe('axiosRetry(axios, { retries, retryCondition })', () => {
         done();
       }, done.fail);
     });
+
+    it('should retry if retryCondition not met', (done) => {
+      const client = axios.create();
+      setupResponses(client, [
+        () => nock('http://example.com').get('/test').reply(200, 'Not what I expected'),
+        () => nock('http://example.com').get('/test').reply(200, 'Not what I expected'),
+        () => nock('http://example.com').get('/test').reply(200, 'The thing')
+      ]);
+
+      axiosRetry(client, {
+        retries: 5,
+        retryCondition: ({ response }) => response.data !== 'The thing'
+      });
+
+      client.get('http://example.com/test').then((result) => {
+        expect(result.data).toBe('The thing');
+        done();
+      }, done.fail);
+    });
   });
 
   describe('when the response is an error', () => {
@@ -352,7 +371,7 @@ describe('axiosRetry(axios, { retries, retryDelay })', () => {
 
       axiosRetry(client, {
         retries: 4,
-        retryCondition: () => true,
+        retryCondition: ({ response }) => (response ? response.status !== 200 : true),
         retryDelay: () => {
           retryCount += 1;
           return 0;
